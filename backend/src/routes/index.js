@@ -1,69 +1,113 @@
 const express = require('express');
 const router = express.Router();
-const wildberriesService = require('../services/wildberries');
+const { validateApiKey } = require('../middleware/auth');
 const productService = require('../services/productService');
 const statisticsService = require('../services/statisticsService');
+const schedulerService = require('../services/schedulerService');
+const wildberriesService = require('../services/wildberries');
 const { logger } = require('../config/logger');
 
-// Middleware для проверки API ключа
-const validateApiKey = (req, res, next) => {
-    const apiKey = req.headers['x-api-key'];
-    if (!apiKey) {
-        return res.status(401).json({ error: 'API ключ обязателен' });
-    }
-    req.apiKey = apiKey;
-    next();
-};
-
-// Получение информации о товаре
+// Маршрут для получения информации о товаре
 router.get('/products/:articleNumber', validateApiKey, async (req, res) => {
     try {
         const { articleNumber } = req.params;
+        const apiKey = req.headers['x-api-key'];
         
-        // Сначала проверяем в базе
-        let productInfo = await productService.getProduct(articleNumber);
+        // Сначала проверяем, есть ли товар в базе данных
+        let product = await productService.getProduct(articleNumber);
         
-        // Если нет в базе или данные устарели (более 1 часа), запрашиваем с API
-        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-        if (!productInfo || new Date(productInfo.updated_at) < oneHourAgo) {
-            const wbProductInfo = await wildberriesService.getProductInfo(req.apiKey, articleNumber);
-            productInfo = await productService.saveProduct(wbProductInfo);
+        // Если товара нет в базе или данные устарели, получаем их из API
+        if (!product) {
+            logger.info(`Product ${articleNumber} not found in database, fetching from API`);
+            const productInfo = await wildberriesService.getProductInfo(apiKey, articleNumber);
+            product = await productService.saveProduct(productInfo);
         }
-
-        res.json(productInfo);
+        
+        res.json(product);
     } catch (error) {
-        logger.error('Product info error:', error);
+        logger.error(`Product info error: ${error.message}`, { stack: error.stack });
         res.status(error.status || 500).json({ error: error.message });
     }
 });
 
-// Получение статистики
+// Маршрут для получения статистики по товару
 router.get('/statistics/:articleNumber', validateApiKey, async (req, res) => {
     try {
         const { articleNumber } = req.params;
         const { dateFrom, dateTo } = req.query;
-
-        if (!dateFrom || !dateTo) {
-            return res.status(400).json({ error: 'Параметры dateFrom и dateTo обязательны' });
-        }
-
-        // Получаем актуальные данные с API
-        const statistics = await wildberriesService.getDetailedStatistics(req.apiKey, {
+        const apiKey = req.headers['x-api-key'];
+        
+        // Получаем статистику из API
+        const statistics = await wildberriesService.getDetailedStatistics(apiKey, {
             nmId: articleNumber,
-            dateFrom,
-            dateTo
+            dateFrom: dateFrom || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+            dateTo: dateTo || new Date().toISOString().split('T')[0]
         });
-
-        // Сохраняем статистику в базу
-        for (const stat of statistics.details) {
-            await statisticsService.saveStatistics(articleNumber, stat.date, stat);
-        }
-
-        // Возвращаем данные из базы
-        const savedStats = await statisticsService.getStatistics(articleNumber, dateFrom, dateTo);
-        res.json(savedStats);
+        
+        // Сохраняем статистику в базу данных
+        await statisticsService.saveStatistics(articleNumber, statistics);
+        
+        res.json(statistics);
     } catch (error) {
-        logger.error('Statistics error:', error);
+        logger.error(`Statistics error: ${error.message}`, { stack: error.stack });
+        res.status(error.status || 500).json({ error: error.message });
+    }
+});
+
+// Маршрут для добавления задачи автоматического обновления
+router.post('/scheduler/:articleNumber', validateApiKey, async (req, res) => {
+    try {
+        const { articleNumber } = req.params;
+        const { schedule } = req.body;
+        const apiKey = req.headers['x-api-key'];
+        
+        // Проверяем, существует ли товар
+        try {
+            await wildberriesService.getProductInfo(apiKey, articleNumber);
+        } catch (error) {
+            return res.status(404).json({ error: 'Товар не найден' });
+        }
+        
+        // Добавляем задачу в планировщик
+        const result = schedulerService.addTask(articleNumber, apiKey, schedule);
+        
+        if (result) {
+            res.json({ message: `Задача для артикула ${articleNumber} успешно добавлена`, schedule: schedule || '0 * * * *' });
+        } else {
+            res.status(500).json({ error: 'Ошибка при добавлении задачи' });
+        }
+    } catch (error) {
+        logger.error(`Scheduler error: ${error.message}`, { stack: error.stack });
+        res.status(error.status || 500).json({ error: error.message });
+    }
+});
+
+// Маршрут для удаления задачи автоматического обновления
+router.delete('/scheduler/:articleNumber', validateApiKey, async (req, res) => {
+    try {
+        const { articleNumber } = req.params;
+        
+        // Удаляем задачу из планировщика
+        const result = schedulerService.removeTask(articleNumber);
+        
+        if (result) {
+            res.json({ message: `Задача для артикула ${articleNumber} успешно удалена` });
+        } else {
+            res.status(404).json({ error: 'Задача не найдена' });
+        }
+    } catch (error) {
+        logger.error(`Scheduler error: ${error.message}`, { stack: error.stack });
+        res.status(error.status || 500).json({ error: error.message });
+    }
+});
+
+// Маршрут для получения списка активных задач
+router.get('/scheduler', validateApiKey, async (req, res) => {
+    try {
+        const tasks = schedulerService.getTasks();
+        res.json(tasks);
+    } catch (error) {
+        logger.error(`Scheduler error: ${error.message}`, { stack: error.stack });
         res.status(error.status || 500).json({ error: error.message });
     }
 });
